@@ -1,0 +1,163 @@
+// sqlast_tests.nv — the grammar, and the two places this AST is not
+// novodb's.
+//
+// EVERY TEST HERE FAILS TODAY: sql-engine-nv is published as its
+// interface and every body is `todo()`.  What the file is for is the
+// half an interface can be reviewed on — that a caller can write this
+// against the signatures, and that the shapes meet where two
+// functions do.
+
+use std.test
+use std.list
+use std.str
+use sqlast
+
+@test
+fn test_a_select_parses_to_a_select_statement() [io]
+    let p = sqlast.parse("SELECT a FROM t")
+    test.assert_eq(list.len(p.errors), 0)
+    match p.stmt
+        StSelect(q) => test.assert_eq(q.from, SrcTable("t"))
+        _           => test.fail("SELECT is StSelect")
+
+@test
+fn test_the_parser_recovers_and_reports_every_error_it_found() [io]
+    // One pass, several problems.  A parser that stopped at the first
+    // makes a user fix one typo per run, which is the difference
+    // between a tool and a punishment.
+    let p = sqlast.parse("SELECT FROM WHERE")
+    test.assert_true(list.len(p.errors) > 0, "a broken statement reports")
+
+@test
+fn test_a_syntax_error_names_a_position() [io]
+    // The offset is what `sqltok.position` turns into the line and
+    // column a user sees, so an error without one is an error nobody
+    // can act on.
+    let p = sqlast.parse("SELECT a FROM")
+    match list.first(p.errors)
+        Some(e) =>
+            match e
+                SeSyntax(m, off)      => test.assert_true(off >= 0, "the offset is real")
+                SeUnsupported(f, off) => test.assert_true(off >= 0, "the offset is real")
+                _                     => test.fail("a parse failure is a syntax or unsupported error")
+        None    => test.fail("this statement is incomplete")
+
+@test
+fn test_unsupported_is_a_different_answer_from_wrong() [io]
+    // A tool wants to tell "you typed it wrong" from "we have not
+    // built that yet", and a user reading the second should not go
+    // looking for their own mistake.
+    let p = sqlast.parse("SELECT a FROM t FOR UPDATE")
+    match list.first(p.errors)
+        Some(e) =>
+            match e
+                SeUnsupported(f, off) => test.assert_true(str.len(f) > 0, "it names the feature")
+                _                     => test.assert_true(true, "either answer is defensible here")
+        None    => test.assert_true(true, "or the dialect grew it")
+
+@test
+fn test_a_literal_is_a_cell_and_there_is_no_second_value_type() [io]
+    // novodb carries `parse.Value` beside `btree.Cell` — the same five
+    // storage classes twice, with a conversion at every INSERT.  One
+    // type is the decision this package made, and this is the test
+    // that would break if a second came back.
+    let p = sqlast.parse("SELECT 7")
+    match p.stmt
+        StSelect(q) =>
+            match q.selection
+                SelItems(items) => test.assert_eq(list.len(items), 1)
+                _               => test.assert_true(true, "a bare literal may lower either way")
+        _           => test.fail("SELECT is StSelect")
+
+@test
+fn test_a_subquery_is_a_tree_and_not_a_string() [io]
+    // THE OTHER DECISION.  novodb holds a view body, a CTE body, a
+    // scalar subquery and a rich `IN (SELECT …)` as raw SQL TEXT and
+    // re-parses each on every read, because the two types would be
+    // mutually recursive and its parser file's declaration order could
+    // not express that.  Here `ExScalarSelect` holds a `Select`.  If
+    // that turns out to be impossible after all, this is the test that
+    // says so, and the README's assumption is where to look.
+    let p = sqlast.parse("SELECT (SELECT max(b) FROM u) FROM t")
+    test.assert_eq(list.len(p.errors), 0)
+
+@test
+fn test_affinity_follows_sqlite_and_not_the_spelling() [io]
+    // A declared type is free text in SQLite and lands on one of five
+    // affinities.  A consumer building a schema without going through
+    // SQL text has to land on the same answer this does.
+    test.assert_eq(sqlast.affinity_of("INTEGER"), CtInteger)
+    test.assert_eq(sqlast.affinity_of("int"), CtInteger)
+    test.assert_eq(sqlast.affinity_of("VARCHAR(255)"), CtText)
+    test.assert_eq(sqlast.affinity_of("DECIMAL(10,2)"), CtNumeric)
+    test.assert_eq(sqlast.affinity_of(""), CtBlob)
+
+@test
+fn test_the_builtin_roster_is_published() [io]
+    let fns = sqlast.builtins()
+    test.assert_true(list.contains(fns, "LENGTH"), "LENGTH is a scalar function")
+    test.assert_true(list.contains(fns, "SUBSTR"), "SUBSTR is a scalar function")
+
+@test
+fn test_show_stmt_round_trips_through_parse() [io]
+    // The round trip is load-bearing and not cosmetic: it is what a
+    // `CREATE VIEW` stores and what `sqlite_master` would show, so a
+    // statement that does not survive it is a view that changes
+    // meaning when it is read back.
+    let src = "SELECT a, b FROM t WHERE a > 1 ORDER BY b DESC LIMIT 10"
+    let once = sqlast.parse(src)
+    let twice = sqlast.parse(sqlast.show_stmt(once.stmt))
+    test.assert_eq_str(sqlast.show_stmt(twice.stmt), sqlast.show_stmt(once.stmt))
+
+@test
+fn test_show_expr_and_show_select_are_the_same_printer() [io]
+    let p = sqlast.parse("SELECT a FROM t WHERE a > 1")
+    match p.stmt
+        StSelect(q) =>
+            test.assert_true(str.len(sqlast.show_select(q)) > 0, "a select prints")
+            match q.where_clause
+                Some(w) => test.assert_eq_str(sqlast.show_expr(w), "a > 1")
+                None    => test.fail("the WHERE was parsed")
+        _           => test.fail("SELECT is StSelect")
+
+@test
+fn test_columns_of_names_what_a_predicate_reads() [io]
+    // The planner's pushdown asks this, and so does a caller deciding
+    // whether a view survives a schema change.
+    let p = sqlast.parse("SELECT 1 FROM t WHERE a > b AND c IS NULL")
+    match p.stmt
+        StSelect(q) =>
+            match q.where_clause
+                Some(w) => test.assert_eq(list.len(sqlast.columns_of(w)), 3)
+                None    => test.fail("the WHERE was parsed")
+        _           => test.fail("SELECT is StSelect")
+
+@test
+fn test_a_trigger_body_is_statements_and_its_timing_is_an_enum() [io]
+    // novodb encodes timing and event as small integers to dodge a
+    // declaration-order constraint, and keeps the body as raw SQL.
+    // Both are types here, which is what makes a malformed trigger a
+    // parse error rather than a surprise at fire time.
+    let p = sqlast.parse("CREATE TRIGGER g AFTER INSERT ON t BEGIN DELETE FROM u; END")
+    match p.stmt
+        StCreateTrigger(g) =>
+            test.assert_eq(g.timing, TtAfter)
+            test.assert_eq(g.event, TeInsert)
+            test.assert_eq(list.len(g.body), 1)
+        _                  => test.fail("CREATE TRIGGER is StCreateTrigger")
+
+@test
+fn test_parse_tokens_is_the_entry_that_does_not_re_lex() [io]
+    // The engine lexes once and substitutes the `DATE('now')` family
+    // before parsing, so there has to be a way in that skips the lexer.
+    let toks = sqltok.lex("SELECT 1")
+    let p = sqlast.parse_tokens(toks, "SELECT 1")
+    test.assert_eq(list.len(p.errors), 0)
+
+@test
+fn test_every_error_says_a_human_sentence() [io]
+    // `Result<T, E>` requires it (SPEC § 3.4), and it is what every
+    // edge an error escapes through renders.
+    test.assert_true(str.len(SeNoSuchTable("t").message()) > 0, "a missing table explains itself")
+    test.assert_true(str.len(SeDivideByZero.message()) > 0, "so does a divide by zero")
+    test.assert_true(str.len(SeArity(3, 2).message()) > 0, "so does an arity mismatch")

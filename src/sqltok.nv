@@ -1,0 +1,136 @@
+// sqltok.nv — SQL text to tokens.
+//
+// WHY `Token` IS A STRUCT AND NOT AN ENUM WITH A HUNDRED ARMS
+//
+// novodb's `lex.Tok` has one nullary variant per reserved word —
+// `TkSelect`, `TkFrom`, `TkWhere`, and about a hundred and thirty more
+// — and one `is_tk_<word>` predicate for each.  Its own parser never
+// matches the enum: the file that would have to says so at the top,
+// *"this file does not pattern-match on `lex.Tok`.  Every Tok-shape
+// decision goes through the predicates and extractors `src/lex.nv`
+// exports … so the token representation stays private to the lexer."*
+//
+// Inside one package a rule kept by convention is free.  Across a
+// package boundary it is not: publishing the enum publishes 130
+// variants a consumer may match on, and then every keyword added to
+// the dialect is a breaking change for anybody who did.  So the shape
+// novodb's own rule was protecting is the shape that ships — a
+// `Token` with a small kind, the text it covered, and where it was —
+// and `keyword` answers the one question a caller actually asks.
+//
+// WHAT IS AND IS NOT LEXED
+//
+// The dialect is SQLite's, in the subset novodb accepts.  Two gaps in
+// that subset are gaps here too, and both are dialect facts a consumer
+// has to know before it feeds this thing a file:
+//
+//   * SQL COMMENTS ARE NOT RECOGNISED.  Neither `-- …` nor `/* … */`.
+//     A `-` followed by a `-` lexes as two minus operators.
+//   * DOUBLE-QUOTED AND BACKTICK-QUOTED IDENTIFIERS ARE NOT
+//     RECOGNISED.  An identifier is a run of ASCII letters, digits and
+//     underscores, so a column named `"select"` cannot be spelled.
+//
+// Both are on the list this package means to close before `0.1.0`,
+// and both are stated rather than discovered because a dump that
+// carries a comment is the first file most people try.
+
+use std.list
+
+// What a token is, at the coarseness a consumer needs.
+//
+// A keyword's identity is `keyword()`, not a variant: see the note at
+// the top of the module for why the enum stops here.
+pub enum TokKind
+    // A reserved word.  `keyword` gives the upper-case spelling.
+    TkKeyword
+    // An identifier: ASCII letters, digits and underscore, first
+    // character not a digit.  Case is preserved.
+    TkIdent
+    // A decimal integer literal.
+    TkInt
+    // A decimal float literal.
+    TkFloat
+    // A single-quoted string literal, with `''` for an embedded
+    // apostrophe.  `text` is the decoded content, not the quoted form.
+    TkStr
+    // A hex blob literal, `X'a1b2'`.  `text` is the hex digits.
+    TkBlob
+    // Punctuation or an operator: `, ( ) ; * = < > <= >= != || | & ~
+    // << >> + - / % .`
+    TkPunct
+    // The input ran out.  One of these ends every token list.
+    TkEnd
+    // The lexer could not read this byte run.  `text` is what it saw.
+    TkErr
+
+// One token: what it is, what it covered, and where it started.
+//
+// `offset` is a byte offset into the source string, which is what
+// `SqlError`'s line and column are computed from — an error a user
+// sees names a position in the SQL they typed, and nothing else in
+// the pipeline is holding on to the text.
+pub struct Token
+    kind: TokKind
+    text: Str
+    offset: Int
+
+// Tokenise a whole statement.
+//
+// Never fails: an unreadable run becomes a `TkErr` token and the scan
+// continues, so the parser reports one error with a position rather
+// than the lexer reporting a different one without.  The list always
+// ends with a `TkEnd`.
+//
+// ```novo
+// use sqltok
+//
+// fn main() [io]
+//     let toks = sqltok.lex("SELECT 1")
+//     println(string_of_int(list.len(toks)))    // 3: SELECT, 1, end
+// ```
+pub fn lex(src: Str) -> [Token]
+    todo("sql-engine-nv.sqltok.lex")
+
+// The reserved word this token is, upper-cased, or `None` when it is
+// not a keyword.
+//
+// Upper-cased because the match is case-insensitive and a caller
+// comparing against `"SELECT"` should not have to care what the user
+// typed.
+pub fn keyword(t: Token) -> ?Str
+    todo("sql-engine-nv.sqltok.keyword")
+
+// True when this token is the named reserved word, compared without
+// regard to case.
+//
+// The one predicate that replaces novodb's hundred and thirty.
+pub fn is_keyword(t: Token, word: Str) -> Bool
+    todo("sql-engine-nv.sqltok.is_keyword")
+
+// The full reserved-word list this lexer recognises, upper-cased and
+// sorted.
+//
+// It is public because it is the DIALECT: a tool that highlights or
+// completes SQL for this engine needs the set, and a consumer choosing
+// a column name needs to know what it cannot be called.
+pub fn keywords() -> [Str]
+    todo("sql-engine-nv.sqltok.keywords")
+
+// The line and column of a byte offset in this source, both 1-based.
+//
+// Kept here rather than in the error type because it needs the source
+// text, which the error does not carry.
+pub fn position(src: Str, offset: Int) -> LineCol
+    todo("sql-engine-nv.sqltok.position")
+
+// A 1-based line and column.
+pub struct LineCol
+    line: Int
+    col: Int
+
+// The token list rendered back to SQL, one space between tokens.
+//
+// Used by the round-trip check the parser's test suite runs, and by
+// the `EXPLAIN` output, so it is behaviour rather than a debug aid.
+pub fn show(toks: [Token]) -> Str
+    todo("sql-engine-nv.sqltok.show")

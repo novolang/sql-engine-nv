@@ -1,0 +1,531 @@
+// sqlast.nv — the dialect, written as types.
+//
+// `Stmt` below is the authoritative list of statement forms this
+// engine accepts and `Expr` the list of expression forms, and both are
+// novodb's — derived from `orbit/novodb/src/parse.nv`, which is a
+// recursive-descent parser over a subset of SQLite's SQL.  Where
+// SQLite and the SQL standard disagree — bitwise-versus-comparison
+// precedence, INTERSECT precedence — this follows SQLite.
+//
+// The grammar, loosest binding first:
+//
+//   OR < AND < NOT < comparison / IS / LIKE / GLOB / BETWEEN / IN
+//      < bitwise (& | << >>) < + - < * / % < unary - ~ < primary
+//
+// WHERE THIS DIFFERS FROM WHAT IT WAS DERIVED FROM
+//
+// novodb holds several sub-selects as RAW SQL TEXT rather than as a
+// nested `SelectStmt`, and its own comments give the reason: the two
+// types would be mutually recursive, *"which this file's declaration
+// order cannot express"*.  So a `CREATE VIEW` body, a CTE body, a
+// scalar subquery and a rich `IN (SELECT …)` are all strings that the
+// executor re-lexes and re-parses on every read.
+//
+// That is a compiler limitation showing through a data type, and this
+// package does NOT carry it forward: `Select` below holds `?Select`
+// and `[Select]` directly, and the re-parse is gone with it.  A
+// consumer reading `Expr` gets a tree.  Whether the limitation is
+// still real is a question for the implementation lane and not for
+// this interface — it is filed as an assumption in the README.
+//
+// The second difference is `Cell`.  novodb has `parse.Value` for a
+// literal and `btree.Cell` for a stored value — the same five storage
+// classes, twice, with a conversion at every INSERT.  Here there is
+// one, it is btree-nv's, and it is the storage one.
+
+use cell
+use sqltok
+
+// A column's declared storage class.
+//
+// These are SQLite's five type AFFINITIES and not a closed set of
+// spellings: a declared type is free text, and `affinity_of` maps
+// whatever the schema wrote onto one of these.
+pub enum ColType
+    CtInteger
+    CtReal
+    CtText
+    // `BLOB`, and the affinity of a column with no declared type.
+    CtBlob
+    // The affinity of DECIMAL / NUMERIC / BOOLEAN / DATE and friends.
+    CtNumeric
+
+// The affinity SQLite gives a declared type name.
+//
+// Public because a consumer building a schema from somewhere other
+// than SQL text — a migration tool, an importer — has to land on the
+// same answer the parser would.
+pub fn affinity_of(declared: Str) -> ColType
+    todo("sql-engine-nv.sqlast.affinity_of")
+
+// One column of a `CREATE TABLE`.
+//
+// `check` is an `?Expr` rather than novodb's text, for the reason at
+// the top of the module.
+pub struct ColDef
+    name: Str
+    ty: ColType
+    not_null: Bool
+    unique: Bool
+    // PRIMARY KEY implies UNIQUE and NOT NULL.  At most one column per
+    // table carries it.
+    primary_key: Bool
+    // `INTEGER PRIMARY KEY AUTOINCREMENT`: an INSERT that omits this
+    // column, or passes NULL, gets `max(col) + 1`, or 1 on an empty
+    // table.  Only meaningful with `CtInteger` and `primary_key`.
+    auto_increment: Bool
+    default_value: ?cell.Cell
+    check: ?Expr
+
+// A comparison operator.
+pub enum CmpOp
+    OpEq
+    OpNe
+    OpLt
+    OpGt
+    OpLe
+    OpGe
+
+// An arithmetic, concatenation or bitwise operator.
+//
+// The bitwise four carry SQLite's precedence, which binds tighter than
+// comparison and looser than `+`/`-`; the SQL standard disagrees and
+// this follows SQLite.
+pub enum BinOp
+    BopAdd
+    BopSub
+    BopMul
+    BopDiv
+    BopMod
+    // String `||`.
+    BopConcat
+    BopBitAnd
+    BopBitOr
+    BopShl
+    BopShr
+
+// An aggregate function.
+pub enum AggKind
+    // `COUNT(*)` — counts rows, ignoring the column.
+    AkCount
+    // `COUNT(col)` — counts non-NULL cells.
+    AkCountCol
+    AkCountDistinct
+    AkSum
+    AkAvg
+    AkMin
+    AkMax
+    // `GROUP_CONCAT(col [, sep])`.
+    AkGroupConcat
+    // `TOTAL(col)` — SUM, but 0 rather than NULL on an empty group.
+    AkTotal
+    AkMedian
+
+// An aggregate call in a select list or a HAVING clause.
+pub struct AggCall
+    kind: AggKind
+    // `"*"` for `COUNT(*)`; a column name otherwise.
+    column: Str
+    // The `GROUP_CONCAT` separator, `","` by default and ignored by
+    // every other kind.
+    separator: Str
+    // `DISTINCT` on SUM / AVG / GROUP_CONCAT.  `COUNT(DISTINCT …)` is
+    // `AkCountDistinct` instead, and MIN / MAX accept the word but it
+    // changes nothing for them.
+    distinct: Bool
+
+// An expression.
+//
+// The sub-select arms hold a `Select` rather than novodb's raw text —
+// see the module header.
+pub enum Expr
+    ExColumn(name: Str)
+    // `t.x`.
+    ExQualified(table: Str, column: Str)
+    // A literal of any storage class, which is why there is no
+    // separate integer / float / string / blob / null arm.
+    ExLiteral(value: cell.Cell)
+    ExAgg(call: AggCall)
+    ExCompare(op: CmpOp, lhs: Expr, rhs: Expr)
+    // `<e> IS [NOT] NULL`.
+    ExIsNull(operand: Expr, negated: Bool)
+    // `<e> IS [NOT] DISTINCT FROM <e2>` — NULL-safe equality.
+    ExIsDistinct(lhs: Expr, rhs: Expr, negated: Bool)
+    ExBinop(op: BinOp, lhs: Expr, rhs: Expr)
+    // `<e> [NOT] LIKE|GLOB <pattern> [ESCAPE <c>]`.
+    ExLike(operand: Expr, pattern: Str, escape: Str, negated: Bool, glob: Bool)
+    ExBetween(operand: Expr, low: Expr, high: Expr, negated: Bool)
+    // `<e> [NOT] IN (<v>, …)`.
+    ExIn(operand: Expr, values: [Expr], negated: Bool)
+    // `<e> [NOT] IN (SELECT …)`.
+    ExInSelect(operand: Expr, inner: Select, negated: Bool)
+    // `(SELECT …)` in expression position: the first cell of the first
+    // row, NULL for no rows.  A multi-row result is
+    // implementation-defined in SQLite and takes the first row here.
+    ExScalarSelect(inner: Select)
+    // `EXISTS (SELECT …)`.  `NOT EXISTS` parses as `ExNot(ExExists(…))`.
+    ExExists(inner: Select)
+    // `CASE WHEN … THEN … [ELSE …] END`, the two lists parallel.
+    ExCase(conditions: [Expr], results: [Expr], otherwise: ?Expr)
+    ExCoalesce(args: [Expr])
+    // `NULLIF(a, b)` — NULL when `a == b`, else `a`.
+    ExNullif(lhs: Expr, rhs: Expr)
+    // A scalar function call.  `builtins()` is the roster.
+    ExCall(name: Str, args: [Expr])
+    ExCast(operand: Expr, ty: ColType)
+    ExAnd(lhs: Expr, rhs: Expr)
+    ExOr(lhs: Expr, rhs: Expr)
+    ExNot(operand: Expr)
+    // Unary `~`.
+    ExBitNot(operand: Expr)
+    // `<fn>(<args>) OVER (PARTITION BY … ORDER BY … ROWS BETWEEN …)`.
+    ExWindow(spec: WindowCall)
+
+// A window-function call.
+//
+// novodb holds every clause of the `OVER (…)` as raw text and
+// re-parses it per row group.  Here they are parsed once.
+pub struct WindowCall
+    // Case-insensitive: ROW_NUMBER, RANK, DENSE_RANK, FIRST_VALUE,
+    // LAST_VALUE, NTH_VALUE, NTILE, LAG, LEAD, and the aggregates used
+    // as windows.
+    name: Str
+    args: [Expr]
+    partition_by: [Expr]
+    order_by: [OrderTerm]
+    // `ROWS BETWEEN <start> AND <end>`, absent when the whole
+    // partition is the frame.
+    frame: ?Frame
+
+// A window frame, in rows.
+pub struct Frame
+    // Rows before the current one, or -1 for UNBOUNDED PRECEDING.
+    preceding: Int
+    // Rows after the current one, or -1 for UNBOUNDED FOLLOWING.
+    following: Int
+
+// One item of a select list.
+pub enum SelItem
+    SiColumn(name: Str)
+    SiAgg(call: AggCall)
+    SiExpr(value: Expr)
+    SiAliased(item: SelItem, as_name: Str)
+
+// What a SELECT projects.
+//
+// `SelColumns` and `SelAgg` are specialisations the executor has
+// dedicated paths for; `SelItems` is the general form and is what a
+// list mixing aggregates with columns, or holding a computed or
+// aliased item, becomes.
+pub enum Selection
+    SelStar
+    SelColumns(names: [Str])
+    SelAgg(call: AggCall)
+    SelItems(items: [SelItem])
+
+// One `ORDER BY` term.
+pub struct OrderTerm
+    key: Expr
+    descending: Bool
+
+// What kind of join.
+pub enum JoinKind
+    JkInner
+    JkLeft
+    JkRight
+    JkFull
+
+// One joined source.
+//
+// The SQL-89 comma list `FROM a, b` and an explicit `CROSS JOIN` both
+// lower to `JkInner` with a constant-true predicate, which is SQLite's
+// semantics for both and means neither needs a kind of its own.
+pub struct Join
+    kind: JoinKind
+    source: Source
+    as_name: ?Str
+    on: Expr
+    // `JOIN … USING (col, …)`.  Empty means the `on` predicate above;
+    // non-empty means synthesise `L.col = R.col AND …` per side.
+    using: [Str]
+
+// Where a SELECT's rows come from.
+pub enum Source
+    SrcTable(name: Str)
+    // `FROM (SELECT …)`.  novodb holds this as text; here it is a tree.
+    SrcSelect(inner: Select)
+
+// A SELECT.
+pub struct Select
+    from: Source
+    as_name: ?Str
+    joins: [Join]
+    distinct: Bool
+    selection: Selection
+    where_clause: ?Expr
+    group_by: [Str]
+    having: ?Expr
+    order_by: [OrderTerm]
+    limit: ?Int
+    offset: ?Int
+    // `WITH name AS (SELECT …)` bindings in scope for this SELECT.
+    ctes: [Cte]
+    // Arms after the first of a `UNION` / `INTERSECT` / `EXCEPT`
+    // chain.  Evaluated flat and left-associative, matching SQLite;
+    // the SQL standard gives INTERSECT higher precedence.
+    set_arms: [SetArm]
+
+// One arm of a compound SELECT.
+pub struct SetArm
+    op: SetOp
+    all: Bool
+    select: Select
+
+// The set operator joining one arm to the running result.
+pub enum SetOp
+    SoUnion
+    SoIntersect
+    SoExcept
+
+// One `WITH` binding.
+//
+// `recursive` mirrors the WITH-level keyword, which the SQL standard
+// scopes to the whole clause rather than to one binding.  Empty
+// `columns` means the schema comes from the body's anchor SELECT.
+pub struct Cte
+    name: Str
+    columns: [Str]
+    recursive: Bool
+    body: Select
+
+// A `FOREIGN KEY` constraint.
+//
+// An `ON DELETE` / `ON UPDATE` action parses and is recorded; the
+// executor evaluates every action as NO ACTION, which novodb does too
+// and which this package means to close before `0.1.0`.
+pub struct ForeignKey
+    columns: [Str]
+    parent_table: Str
+    parent_columns: [Str]
+    on_delete: RefAction
+    on_update: RefAction
+    // `DEFERRABLE INITIALLY DEFERRED`: inside an explicit
+    // `BEGIN`…`COMMIT`, the check runs at COMMIT rather than per row.
+    deferred: Bool
+
+// What a referential action asks for.
+pub enum RefAction
+    RaNoAction
+    RaCascade
+    RaSetNull
+    RaSetDefault
+    RaRestrict
+
+// `INSERT OR <action>` conflict resolution.
+//
+// With no `OR` clause SQLite defaults to `CaAbort`: roll the failing
+// statement back and keep the transaction.
+pub enum ConflictAction
+    CaAbort
+    CaReplace
+    CaIgnore
+    // Error, and keep the rows already inserted.
+    CaFail
+    CaRollback
+
+// An `ON CONFLICT` tail clause.
+pub struct Upsert
+    // The target column list.  It parses and is recorded; any unique
+    // constraint trips the clause, which is SQLite's behaviour when
+    // the list is omitted.
+    target: [Str]
+    // `DO NOTHING` when `set` is empty, `DO UPDATE SET …` otherwise.
+    set: [Assignment]
+    where_clause: ?Expr
+
+// One `SET col = expr`.
+pub struct Assignment
+    column: Str
+    value: Expr
+
+// An `ALTER TABLE` action.
+pub enum AlterAction
+    AaAddColumn(column: ColDef)
+    AaRenameColumn(old_name: Str, new_name: Str)
+    AaDropColumn(name: Str)
+    AaRenameTable(new_name: Str)
+
+// A statement.
+//
+// This list is the dialect: what is not an arm here is not accepted,
+// and `SqlError`'s `SeUnsupported` is what a caller gets for the rest.
+pub enum Stmt
+    StCreateTable(name: Str, columns: [ColDef], checks: [Expr], foreign_keys: [ForeignKey],
+                  if_not_exists: Bool)
+    StDropTable(name: Str, if_exists: Bool)
+    StAlterTable(name: Str, action: AlterAction)
+    // Schema-only.  The catalog records the index and no query path
+    // consults one: every access is a full tree scan.  `CREATE INDEX`
+    // is accepted so that a SQLite dump loads.
+    StCreateIndex(name: Str, table: Str, columns: [Str], descending: [Bool], unique: Bool)
+    StDropIndex(name: Str, if_exists: Bool)
+    StCreateView(name: Str, body: Select)
+    StDropView(name: Str, if_exists: Bool)
+    StCreateTrigger(trigger: Trigger)
+    StDropTrigger(name: Str, if_exists: Bool)
+    StInsert(insert: Insert)
+    StSelect(select: Select)
+    StUpdate(table: Str, sets: [Assignment], where_clause: ?Expr, returning: [SelItem])
+    StDelete(table: Str, where_clause: ?Expr, returning: [SelItem])
+    StBegin
+    StCommit
+    StRollback
+    StSavepoint(name: Str)
+    StRelease(name: Str)
+    StRollbackTo(name: Str)
+    // Parsed and accepted; execution is a no-op.  A SQLite dump almost
+    // always opens with a few, and accepting them is what lets the rest
+    // of the dump load without pre-processing.
+    StPragma(name: Str, value: Str)
+    // `ANALYZE [<table>]` — refresh the statistics the cost model
+    // reads.  An empty name means every table.
+    StAnalyze(table: Str)
+    // `EXPLAIN [ANALYZE] <select>`.  `analyze` runs the query as well
+    // and appends the actual row count and elapsed time.
+    StExplain(inner: Select, analyze: Bool)
+
+// An `INSERT`.
+pub struct Insert
+    table: Str
+    // Empty means a positional insert: every column, in schema order.
+    columns: [Str]
+    // Literal rows.  Empty when `source` or `default_values` is used.
+    rows: [[Expr]]
+    // `INSERT … SELECT`.
+    source: ?Select
+    // `INSERT INTO t DEFAULT VALUES`.  Mutually exclusive with the
+    // two above.
+    default_values: Bool
+    conflict: ConflictAction
+    upsert: ?Upsert
+    // `RETURNING <items>`.  Empty means no clause; non-empty makes the
+    // statement produce rows.  Aggregates are rejected — RETURNING is
+    // row by row.
+    returning: [SelItem]
+
+// A `CREATE TRIGGER`.
+//
+// novodb encodes timing and event as small integers to dodge a
+// declaration-order constraint and keeps the body as raw SQL.  Here
+// both are enums and the body is a statement list.
+pub struct Trigger
+    name: Str
+    table: Str
+    timing: TriggerTiming
+    event: TriggerEvent
+    // Only meaningful for `UPDATE OF (cols)`; empty otherwise.
+    update_columns: [Str]
+    when_clause: ?Expr
+    body: [Stmt]
+
+// When a trigger fires relative to the statement.
+pub enum TriggerTiming
+    TtBefore
+    TtAfter
+    TtInsteadOf
+
+// What a trigger fires on.
+pub enum TriggerEvent
+    TeInsert
+    TeUpdate
+    TeDelete
+
+// Parse one statement.
+//
+// The parser recovers: it returns a statement AND a list of errors, so
+// a caller can report several problems in one pass rather than one per
+// run.  A non-empty `errors` means the statement is not trustworthy.
+pub fn parse(src: Str) -> Parsed
+    todo("sql-engine-nv.sqlast.parse")
+
+// Parse a statement from tokens already lexed.
+//
+// The engine lexes once and substitutes the `DATE('now')` family
+// before parsing — see `sqlengine.substitute_now` — so this is the
+// entry that does not re-lex.
+pub fn parse_tokens(toks: [sqltok.Token], src: Str) -> Parsed
+    todo("sql-engine-nv.sqlast.parse_tokens")
+
+// A parsed statement and everything that was wrong with it.
+pub struct Parsed
+    stmt: Stmt
+    errors: [SqlError]
+
+// The roster of scalar functions `ExCall` may name.
+//
+// Public for the same reason `sqltok.keywords` is: it is the dialect,
+// and a tool that completes SQL for this engine needs the list.
+pub fn builtins() -> [Str]
+    todo("sql-engine-nv.sqlast.builtins")
+
+// Render a statement back to SQL.
+//
+// The round trip is load-bearing rather than cosmetic: it is what a
+// `CREATE VIEW` stores, what `sqlite_master` would show, and what the
+// parser's own round-trip test compares against.
+pub fn show_stmt(s: Stmt) -> Str
+    todo("sql-engine-nv.sqlast.show_stmt")
+
+// Render an expression back to SQL.
+pub fn show_expr(e: Expr) -> Str
+    todo("sql-engine-nv.sqlast.show_expr")
+
+// Render a SELECT back to SQL.
+pub fn show_select(s: Select) -> Str
+    todo("sql-engine-nv.sqlast.show_select")
+
+// Every column an expression names, in the order they appear.
+//
+// The planner's predicate pushdown asks this, and so does a caller
+// deciding whether a view survives a schema change.
+pub fn columns_of(e: Expr) -> [Str]
+    todo("sql-engine-nv.sqlast.columns_of")
+
+// Why a statement could not be parsed, planned or run.
+//
+// One type for all three stages: a caller catching an error does not
+// care which pass produced it, and the arms that only one pass can
+// produce are still one `match`.
+pub enum SqlError
+    // The text is not this dialect.  `offset` is a byte offset into
+    // the source, which `sqltok.position` turns into a line and column.
+    SeSyntax(message: Str, offset: Int)
+    // The text is SQL this engine does not accept.  The arm exists so
+    // a consumer can tell "you typed it wrong" from "we have not built
+    // that yet" — the two want different answers from a tool.
+    SeUnsupported(feature: Str, offset: Int)
+    SeNoSuchTable(name: Str)
+    SeNoSuchColumn(table: Str, column: Str)
+    SeAmbiguousColumn(column: Str)
+    // A row's value count does not match the column count.
+    SeArity(expected: Int, got: Int)
+    // A NOT NULL, UNIQUE, PRIMARY KEY, CHECK or FOREIGN KEY constraint
+    // rejected the row.
+    SeConstraint(constraint: Str, detail: Str)
+    // A value was not of a class the operation accepts.
+    SeType(detail: Str)
+    // Integer division or modulo by zero.
+    SeDivideByZero
+    // The host handed back a page that did not decode.
+    SeBadPage(page_id: Int, detail: Str)
+    // A statement was stepped after it finished, or fed a page it had
+    // not asked for.
+    SeProtocol(detail: Str)
+
+// The human sentence behind each way a statement can fail.
+//
+// `Result<T, E>` carries an `Error` bound (SPEC § 3.4), so this impl
+// is what lets `prepare` return the enum rather than a string.
+impl Error for SqlError
+    fn message(self) -> Str
+        todo("sql-engine-nv.sqlast.SqlError.message")

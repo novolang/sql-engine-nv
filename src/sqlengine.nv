@@ -1,0 +1,307 @@
+// sqlengine.nv — SQL in, rows out, and not one byte read.
+//
+// THE LOAD-BEARING INTERFACE IS `StepResult`
+//
+// Five calls are the whole package from a host's side:
+//
+//     open(schema)                 -> Engine
+//     prepare(engine, sql)         -> Result<Statement, SqlError>
+//     step(engine, statement)      -> Advance { engine, statement, result }
+//     feed_page(engine, id, bytes) -> Engine
+//     feed_alloc(engine, id)       -> Engine
+//
+// `step` answers `SrRow`, `SrDone`, `SrPage` or `SrError`.  `SrPage`
+// carries a `btree.PageRequest`, the host performs it, feeds the
+// answer back, and steps again.  Nothing here opens a file, and
+// nothing here can: this is `core`, its budget is `[]`, and the
+// compiler refuses a body that exceeds it.
+//
+// WHY `SrPage(PageRequest)` AND NOT `NeedPage` / `WritePage` INLINE
+//
+// Two reasons, and the second is the one that decided it.  A read is
+// not the only thing a statement needs — an INSERT that splits a leaf
+// needs a page ALLOCATED, and a DELETE that empties one needs it
+// FREED, so a two-armed enum would have to grow two more arms and
+// they would be btree-nv's arms spelled a second time.  And every
+// request that leaves this function came out of a `btree.Cursor` this
+// package is holding: the engine has no page of its own to want.  So
+// the type is btree-nv's and this enum relays it.  btree-nv's README
+// carries the other half of the argument.
+//
+// WHAT THE ENGINE IS NOT
+//
+// It is not a connection and it holds no transaction.  novodb's
+// `conn.nv` is the layer that owns a `Connection`, a snapshot stack
+// for SAVEPOINT, and a committed-versus-pending catalog — and every
+// one of those decisions is about DURABILITY, which is the pager's.
+// `StBegin`, `StCommit` and `StRollback` parse and step to
+// `SrDone(0)`; what they mean is `pager-nv`'s to decide.
+
+use cell
+use btree
+use sqltok
+use sqlast
+use sqlplan
+
+// What the engine knows about the tables it can reach.
+//
+// Handed in at `open` rather than read: reading it is a page walk, and
+// a page walk is the host's.  `pager-nv` reconstructs this from the
+// file's own catalog and passes it here.
+pub struct Schema
+    tables: [TableDef]
+    views: [ViewDef]
+    triggers: [sqlast.Trigger]
+    indexes: [IndexDef]
+
+// One table: its columns, its constraints, and the page its tree is
+// rooted at.
+//
+// `root_page` is what ties this package to btree-nv: the engine opens
+// a `btree.Tree` on it and every row it reads arrives through that.
+pub struct TableDef
+    name: Str
+    columns: [sqlast.ColDef]
+    checks: [sqlast.Expr]
+    foreign_keys: [sqlast.ForeignKey]
+    root_page: Int
+    // The next rowid to hand out, and the AUTOINCREMENT high-water
+    // mark.  SQLite keeps the second so a deleted id is not reused;
+    // the two differ after a DELETE and that difference is observable.
+    next_rowid: Int
+    auto_increment_high: Int
+
+// One view: its name and the SELECT it stands for.
+//
+// The body is a parsed `Select` and not text — see `sqlast`'s header
+// for why that differs from novodb.
+pub struct ViewDef
+    name: Str
+    body: sqlast.Select
+
+// One index.  Recorded so that a SQLite dump round-trips; no query
+// path consults one.
+pub struct IndexDef
+    name: Str
+    table: Str
+    columns: [Str]
+    descending: [Bool]
+    unique: Bool
+
+// An empty schema.
+pub fn schema_new() -> Schema
+    todo("sql-engine-nv.sqlengine.schema_new")
+
+// The schema with this table in it, replacing any table of that name.
+pub fn schema_with_table(s: Schema, t: TableDef) -> Schema
+    todo("sql-engine-nv.sqlengine.schema_with_table")
+
+// The table of this name, or `None`.
+pub fn schema_table(s: Schema, name: Str) -> ?TableDef
+    todo("sql-engine-nv.sqlengine.schema_table")
+
+// The engine: a schema, and whatever a statement in flight is holding.
+//
+// It is a value.  A host that wants two cursors over one database
+// holds two `Engine`s and knows they cannot alias, which is SPEC
+// § 14's `@value` shape doing the work a lock would otherwise do.
+pub struct Engine
+    schema: Schema
+    // Pages the host has fed that the engine has not consumed.  A host
+    // that prefetches puts them here; one that answers on demand never
+    // has more than one.
+    fed: [FedPage]
+    // Set when the engine asked for a page and has not been given it.
+    awaiting_page: Int
+
+// A page the host has handed over.
+pub struct FedPage
+    page_id: Int
+    bytes: [Int]
+
+// An engine over this schema.
+//
+// ```novo
+// use sqlengine
+//
+// fn main() [io]
+//     let e = sqlengine.open(sqlengine.schema_new())
+//     match sqlengine.prepare(e, "SELECT 1")
+//         Ok(st) => println("prepared")
+//         Err(x) => println(x.message())
+// ```
+pub fn open(schema: Schema) -> Engine
+    todo("sql-engine-nv.sqlengine.open")
+
+// The engine's current schema.
+//
+// A DDL statement changes it, so a host that persists the catalog
+// reads this after each `SrDone` rather than keeping its own copy.
+pub fn schema_of(e: Engine) -> Schema
+    todo("sql-engine-nv.sqlengine.schema_of")
+
+// A prepared statement: parsed, checked against the schema, planned.
+//
+// Holds the plan and the walk's position.  Reusable — `reset` puts it
+// back to the start without re-parsing, which is the whole reason a
+// prepared statement is a type rather than a string.
+pub struct Statement
+    stmt: sqlast.Stmt
+    plan: sqlplan.Plan
+    // The names this statement's rows carry, answered before a row is
+    // produced — a caller building a table header needs them then.
+    columns: [Str]
+    // Rows produced, or rows changed, so far.
+    affected: Int
+    // The tree cursors this statement is walking, innermost last.
+    cursors: [btree.Cursor]
+    // Set once the statement has failed; every later `step` repeats it.
+    failed: ?sqlast.SqlError
+
+// Lex, parse, check and plan one statement.
+//
+// The errors that can come out of here are the ones that need no data:
+// syntax, an unknown table or column, an arity mismatch, an
+// unsupported form.  Everything that needs a row — a constraint, a
+// type, a division by zero — arrives from `step` instead.
+pub fn prepare(e: Engine, sql: Str) -> Result<Statement, sqlast.SqlError>
+    todo("sql-engine-nv.sqlengine.prepare")
+
+// The column names a prepared statement's rows will carry.
+//
+// Available before the first `step`, because a caller that has to draw
+// a header cannot wait for a row that may never come.
+pub fn columns(st: Statement) -> [Str]
+    todo("sql-engine-nv.sqlengine.columns")
+
+// What one `step` did.
+pub enum StepResult
+    // One row of the answer.
+    SrRow(row: [cell.Cell])
+    // The statement finished.  `rows_affected` is the row count for a
+    // SELECT and the number of rows changed for everything else.
+    SrDone(rows_affected: Int)
+    // The engine needs the host to do something with a page before it
+    // can continue.  See the module header for why this is one arm
+    // carrying btree-nv's type rather than four arms of its own.
+    SrPage(request: btree.PageRequest)
+    // The statement failed.  A later `step` repeats this.
+    SrError(err: sqlast.SqlError)
+
+// An engine, a statement and the step they just took.
+//
+// Named `Advance` rather than `Progress` because struct identity is
+// keyed by NAME across a whole build, dependencies included, and
+// btree-nv already publishes a `Progress` with different fields
+// (E2004).  A package that names a common noun takes it from every
+// consumer, which is a fact of this language worth knowing before a
+// package boundary is drawn.
+pub struct Advance
+    engine: Engine
+    statement: Statement
+    result: StepResult
+
+// Advance a statement once.
+//
+// ```novo
+// use sqlengine
+//
+// fn main() [io]
+//     var e = sqlengine.open(sqlengine.schema_new())
+//     match sqlengine.prepare(e, "SELECT 1")
+//         Err(x) => println(x.message())
+//         Ok(st) =>
+//             let p = sqlengine.step(e, st)
+//             match p.result
+//                 SrRow(r)   => println("a row")
+//                 SrDone(n)  => println("done")
+//                 SrPage(q)  => println("the host's turn")
+//                 SrError(x) => println(x.message())
+// ```
+pub fn step(e: Engine, st: Statement) -> Advance
+    todo("sql-engine-nv.sqlengine.step")
+
+// Hand back a page the engine asked for.
+//
+// `bytes` is a whole page, header included.  A host may feed a page
+// the engine has not asked for yet — a prefetch — and the engine will
+// use it when it gets there; a page it will never want is dropped.
+pub fn feed_page(e: Engine, page_id: Int, bytes: [Int]) -> Engine
+    todo("sql-engine-nv.sqlengine.feed_page")
+
+// Hand back the id of a page the engine asked to have allocated.
+pub fn feed_alloc(e: Engine, page_id: Int) -> Engine
+    todo("sql-engine-nv.sqlengine.feed_alloc")
+
+// The page the engine is waiting for, or `None`.
+pub fn awaiting(e: Engine) -> ?Int
+    todo("sql-engine-nv.sqlengine.awaiting")
+
+// Put a statement back to the start, keeping its plan.
+//
+// The point of preparing once and running many times.
+pub fn reset(st: Statement) -> Statement
+    todo("sql-engine-nv.sqlengine.reset")
+
+// The rows a statement has produced or changed so far.
+pub fn affected(st: Statement) -> Int
+    todo("sql-engine-nv.sqlengine.affected")
+
+// The plan a statement will run, for `EXPLAIN` and for a tool showing
+// a user why a query is slow.
+pub fn plan_of(st: Statement) -> sqlplan.Plan
+    todo("sql-engine-nv.sqlengine.plan_of")
+
+// Rewrite the `DATE('now')` family to the literals they render to.
+//
+// THE CLOCK IS THE HOST'S, AND THIS IS WHERE THAT SHOWS.  novodb
+// reaches for `time.now()` at the top of its executor inside a block
+// that DISCHARGES the `[time]` effect — its own comment says the
+// discharge is what *"keeps `exec_sql` and its callers effect-free"*
+// — and a `core` package may not do that: `no-discharge-in-core` is
+// a shard row, and discharging an effect is a lie about a budget
+// rather than a way to meet one.
+//
+// So the substitution stays and the clock leaves.  The host reads its
+// own clock, formats the three strings, and passes them here BEFORE
+// preparing; `pager-nv.now_snapshot` is the `[time]` function that
+// makes one.  A caller that passes an empty snapshot gets `NULL` from
+// every `now` call, which is a defined answer and not a crash.
+pub fn substitute_now(toks: [sqltok.Token], now: NowSnapshot) -> [sqltok.Token]
+    todo("sql-engine-nv.sqlengine.substitute_now")
+
+// A frozen reading of the host's clock.
+//
+// Three strings rather than a timestamp because that is what the
+// substitution puts in the token stream, and because rendering them is
+// `[time]` work that has to happen on the host's side of the line.
+pub struct NowSnapshot
+    date: Str
+    time_of_day: Str
+    datetime: Str
+
+// Evaluate one expression against one row.
+//
+// Public because it is what a CHECK constraint, a DEFAULT, a trigger's
+// WHEN clause and a partial index all need, and because a consumer
+// filtering rows it already holds should not have to build a plan to
+// do it.  `columns` names the row's cells in order.
+pub fn evaluate(e: sqlast.Expr, columns: [Str],
+                row: [cell.Cell]) -> Result<cell.Cell, sqlast.SqlError>
+    todo("sql-engine-nv.sqlengine.evaluate")
+
+// Compare two cells by SQL's ordering.
+//
+// NULL sorts before everything, then integers and floats by value,
+// then text, then blobs — SQLite's storage-class order, which is
+// `cell.tag`.  Answers -1, 0 or 1.
+pub fn compare(a: cell.Cell, b: cell.Cell) -> Int
+    todo("sql-engine-nv.sqlengine.compare")
+
+// Coerce a cell to a column's declared affinity.
+//
+// SQLite applies affinity on the way in, so `INSERT INTO t(n) VALUES
+// ('7')` into an INTEGER column stores the integer 7.  A value that
+// cannot be coerced is stored as it is, which is also SQLite.
+pub fn apply_affinity(c: cell.Cell, ty: sqlast.ColType) -> cell.Cell
+    todo("sql-engine-nv.sqlengine.apply_affinity")

@@ -1,0 +1,273 @@
+// sqlengine_tests.nv — the step protocol, driven by hand.
+//
+// EVERY TEST HERE FAILS TODAY: sql-engine-nv is published as its
+// interface and every body is `todo()`.  The file is written the way a
+// HOST writes against this package, because the loop is the interface,
+// and an interface nobody has written a caller for has not been
+// reviewed.
+
+use std.test
+use std.list
+use std.str
+use cell
+use btree
+use sqltok
+use sqlengine
+
+// One stored page: enough to answer a `PrNeedPage`.
+struct Page
+    id: Int
+    bytes: [Int]
+
+fn page_bytes(pages: [Page], id: Int) -> ?[Int]
+    match list.find(pages, p => p.id == id)
+        Some(p) => Some(p.bytes)
+        None    => None
+
+// What one run of a statement produced, and what it asked for.
+struct Run
+    rows: Int
+    affected: Int
+    reads: Int
+    writes: Int
+    allocs: Int
+    frees: Int
+    stalled: Bool
+    failed: Bool
+
+// Step a statement to `SrDone`, answering reads from `pages` and
+// counting everything else.  `guard` stops a walk that asks for a page
+// nobody has, rather than spinning.
+fn drive_stmt(engine: sqlengine.Engine, st: sqlengine.Statement, pages: [Page]) -> Run
+    var e = engine
+    var s = st
+    var rows = 0
+    var affected = 0 - 1
+    var reads = 0
+    var writes = 0
+    var allocs = 0
+    var frees = 0
+    var stalled = false
+    var failed = false
+    var going = true
+    var guard = 0
+    while going and guard < 128
+        guard += 1
+        let p = sqlengine.step(e, s)
+        e = p.engine
+        s = p.statement
+        match p.result
+            SrRow(r)   =>
+                rows += 1
+            SrDone(n)  =>
+                affected = n
+            SrError(x) =>
+                failed = true
+            SrPage(q)  =>
+                match q
+                    PrNeedPage(id)    =>
+                        reads += 1
+                        match page_bytes(pages, id)
+                            Some(b) =>
+                                e = sqlengine.feed_page(e, id, b)
+                            None    =>
+                                stalled = true
+                    PrWritePage(i, b) =>
+                        writes += 1
+                    PrAllocPage(k)    =>
+                        allocs += 1
+                    PrFreePage(i)     =>
+                        frees += 1
+        if affected >= 0 or stalled or failed
+            going = false
+    Run { rows: rows, affected: affected, reads: reads, writes: writes,
+          allocs: allocs, frees: frees, stalled: stalled, failed: failed }
+
+fn prepared(sql: Str) -> sqlengine.Statement
+    let e = sqlengine.open(sqlengine.schema_new())
+    match sqlengine.prepare(e, sql)
+        Ok(st) => st
+        Err(x) => todo("sqlengine_tests.prepared — " + x.message())
+
+@test
+fn test_a_schema_is_handed_in_and_never_read() [io]
+    // Reading a catalog is a page walk and a page walk is the host's,
+    // so `open` takes what pager-nv already reconstructed.  That is the
+    // whole `core` bargain in one signature.
+    let s = sqlengine.schema_new()
+    let e = sqlengine.open(s)
+    test.assert_eq(list.len(sqlengine.schema_of(e).tables), 0)
+
+@test
+fn test_a_ddl_statement_changes_the_schema_the_engine_reports() [io]
+    // A host that persists the catalog reads it back after each
+    // `SrDone` rather than keeping its own copy, which is what keeps
+    // the two from drifting.
+    let e = sqlengine.open(sqlengine.schema_new())
+    match sqlengine.prepare(e, "CREATE TABLE t (a INTEGER, b TEXT)")
+        Err(x) => test.fail(x.message())
+        Ok(st) =>
+            let out = drive_stmt(e, st, [])
+            test.assert_false(out.failed, "a CREATE TABLE needs no page")
+            test.assert_eq(out.affected, 0)
+
+@test
+fn test_prepare_reports_what_needs_no_data() [io]
+    // Syntax, an unknown table, an arity mismatch, an unsupported form
+    // — everything answerable without a row comes out HERE, so a
+    // caller can reject a statement before it starts reading pages.
+    let e = sqlengine.open(sqlengine.schema_new())
+    match sqlengine.prepare(e, "SELECT FROM")
+        Ok(st) => test.fail("that is not a statement")
+        Err(x) => test.assert_true(str.len(x.message()) > 0, "it says what is wrong")
+
+@test
+fn test_an_unknown_table_is_caught_at_prepare_and_not_at_step() [io]
+    let e = sqlengine.open(sqlengine.schema_new())
+    match sqlengine.prepare(e, "SELECT * FROM nowhere")
+        Ok(st) => test.fail("there is no table called nowhere")
+        Err(x) =>
+            match x
+                SeNoSuchTable(n) => test.assert_eq_str(n, "nowhere")
+                _                => test.fail("the arm names the table")
+
+@test
+fn test_columns_are_known_before_the_first_row() [io]
+    // A caller that has to draw a table header cannot wait for a row
+    // that may never come, so the metadata is answered off the plan.
+    test.assert_eq(sqlengine.columns(prepared("SELECT a, b FROM t")), ["a", "b"])
+
+@test
+fn test_a_select_asks_for_its_root_page_first() [io]
+    // The engine has no page of its own to want: this request came out
+    // of a `btree.Cursor` it is holding, which is the argument for
+    // `SrPage` carrying btree-nv's type rather than four arms of its
+    // own.
+    let e = sqlengine.open(sqlengine.schema_new())
+    let out = drive_stmt(e, prepared("SELECT * FROM t"), [])
+    test.assert_true(out.reads > 0, "a scan reads")
+    test.assert_true(out.stalled, "and stalls when the host has nothing to give")
+
+@test
+fn test_a_select_writes_nothing() [io]
+    // A write the engine did not need is a page the pager has to
+    // journal and fsync, so "did it write" is behaviour and not an
+    // internal.
+    let e = sqlengine.open(sqlengine.schema_new())
+    let out = drive_stmt(e, prepared("SELECT * FROM t"), [])
+    test.assert_eq(out.writes, 0)
+    test.assert_eq(out.allocs, 0)
+    test.assert_eq(out.frees, 0)
+
+@test
+fn test_a_feed_the_engine_did_not_ask_for_is_kept_not_refused() [io]
+    // A host that prefetches is doing the right thing, so a page fed
+    // early is held until the engine gets there.  The asymmetry with
+    // btree-nv — which treats an unasked-for page as an error — is
+    // deliberate: the tree has exactly one outstanding request and the
+    // engine may be holding several cursors.
+    let e = sqlengine.open(sqlengine.schema_new())
+    let fed = sqlengine.feed_page(e, 5, [])
+    test.assert_eq(list.len(fed.fed), 1)
+
+@test
+fn test_awaiting_names_what_the_engine_is_blocked_on() [io]
+    let e = sqlengine.open(sqlengine.schema_new())
+    test.assert_none(sqlengine.awaiting(e))
+
+@test
+fn test_feed_alloc_answers_the_allocation_a_write_asked_for() [io]
+    // The write path's other half.  An INSERT that splits a leaf asks
+    // for a page and cannot continue until it has an id, so the pairing
+    // is as load-bearing as `feed_page` is for a read.
+    let e = sqlengine.open(sqlengine.schema_new())
+    test.assert_none(sqlengine.awaiting(sqlengine.feed_alloc(e, 12)))
+
+@test
+fn test_reset_keeps_the_plan_and_drops_the_position() [io]
+    // The whole reason a prepared statement is a type rather than a
+    // string: prepare once, run many times, and pay the parse once.
+    let st = prepared("SELECT a FROM t")
+    let again = sqlengine.reset(st)
+    test.assert_eq(sqlengine.affected(again), 0)
+    test.assert_eq_str(sqlplan.explain(sqlengine.plan_of(again)),
+                       sqlplan.explain(sqlengine.plan_of(st)))
+
+@test
+fn test_the_clock_arrives_as_an_argument() [io]
+    // novodb reaches for `time.now()` inside a block that DISCHARGES
+    // the `[time]` effect, and says that discharge is what keeps its
+    // executor effect-free.  A `core` package may not:
+    // `no-discharge-in-core` is a shard row, and discharging an effect
+    // is a lie about a budget rather than a way to meet one.  So the
+    // substitution stays and the clock leaves, and THIS SIGNATURE is
+    // where that shows.
+    let toks = sqltok.lex("SELECT DATE('now')")
+    let now = NowSnapshot { date: "2026-09-09", time_of_day: "12:00:00",
+                            datetime: "2026-09-09 12:00:00" }
+    let out = sqlengine.substitute_now(toks, now)
+    test.assert_eq(list.len(out), list.len(toks) - 3)
+
+@test
+fn test_an_empty_snapshot_gives_null_and_not_a_crash() [io]
+    // A caller that passes nothing gets a defined answer, because a
+    // library that panics on a value a caller is allowed to construct
+    // is a library with a trap in it.
+    let toks = sqltok.lex("SELECT DATE('now')")
+    let out = sqlengine.substitute_now(toks, NowSnapshot { date: "", time_of_day: "", datetime: "" })
+    test.assert_true(list.len(out) > 0, "the statement still lexes")
+
+@test
+fn test_evaluate_runs_one_expression_over_one_row() [io]
+    // Public because a CHECK, a DEFAULT, a trigger's WHEN and a partial
+    // index all want it, and because a consumer filtering rows it
+    // already holds should not have to build a plan.
+    match sqlengine.evaluate(ExColumn("a"), ["a", "b"], [cell.of_int(7), cell.null_cell()])
+        Ok(v)  => test.assert_eq(cell.as_int(v), Some(7))
+        Err(x) => test.fail(x.message())
+
+@test
+fn test_evaluate_reports_a_divide_by_zero_rather_than_trapping() [io]
+    let e = ExBinop(BopDiv, ExLiteral(cell.of_int(1)), ExLiteral(cell.of_int(0)))
+    match sqlengine.evaluate(e, [], [])
+        Ok(v)  => test.fail("one over zero is not a value")
+        Err(x) => test.assert_eq(x, SeDivideByZero)
+
+@test
+fn test_compare_follows_sqlite_storage_class_order() [io]
+    // NULL first, then numbers by value, then text, then blobs — which
+    // is `cell.tag`.  A sort that got this wrong would order a mixed
+    // column differently from every other SQLite tool.
+    test.assert_eq(sqlengine.compare(cell.null_cell(), cell.of_int(0)), 0 - 1)
+    test.assert_eq(sqlengine.compare(cell.of_int(1), cell.of_int(1)), 0)
+    test.assert_eq(sqlengine.compare(cell.of_str("a"), cell.of_int(9)), 1)
+
+@test
+fn test_affinity_is_applied_on_the_way_in() [io]
+    // SQLite coerces at INSERT, so `INSERT INTO t(n) VALUES ('7')` into
+    // an INTEGER column stores the integer.  A value that cannot be
+    // coerced is stored as it is, which is also SQLite.
+    test.assert_eq(cell.as_int(sqlengine.apply_affinity(cell.of_str("7"), CtInteger)), Some(7))
+    test.assert_eq(cell.as_str(sqlengine.apply_affinity(cell.of_str("x"), CtInteger)), Some("x"))
+
+@test
+fn test_a_table_carries_the_page_its_tree_is_rooted_at() [io]
+    // The one field that ties this package to btree-nv: the engine
+    // opens a `btree.Tree` on it and every row arrives through that.
+    let t = TableDef { name: "t", columns: [], checks: [], foreign_keys: [],
+                       root_page: 4, next_rowid: 1, auto_increment_high: 0 }
+    let s = sqlengine.schema_with_table(sqlengine.schema_new(), t)
+    match sqlengine.schema_table(s, "t")
+        Some(found) => test.assert_eq(found.root_page, 4)
+        None        => test.fail("the table was just added")
+
+@test
+fn test_a_transaction_statement_parses_and_decides_nothing() [io]
+    // The engine is not a connection and holds no transaction: BEGIN,
+    // COMMIT and ROLLBACK step to `SrDone(0)` and what they MEAN is
+    // pager-nv's, because every one of those decisions is about
+    // durability.
+    let e = sqlengine.open(sqlengine.schema_new())
+    match sqlengine.prepare(e, "BEGIN")
+        Err(x) => test.fail(x.message())
+        Ok(st) => test.assert_eq(drive_stmt(e, st, []).affected, 0)

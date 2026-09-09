@@ -1,0 +1,35 @@
+[package]
+name        = "sql-engine-nv"
+version     = "0.0.1"
+description = "SQL in, rows out, and not one byte read: a lexer, a recursive-descent parser over SQLite's dialect, a rule-and-cost plan IR, and an executor that reaches its tables through page requests the host answers."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: the engine is a state machine over text and page bytes.  It
+# asks for pages and never opens anything — `pager-nv` is the half
+# that touches the file.
+layer       = "core"
+
+category    = "databases"
+tags        = ["sql", "sqlite", "parser", "planner", "executor", "sans-io", "database"]
+repository  = "https://github.com/novolang/sql-engine-nv"
+bugs        = "https://github.com/novolang/sql-engine-nv/issues"
+maintainers = ["novo-lang"]
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The dialect, the step protocol, and what the engine asks the host for"
+
+[dependencies]
+# btree-nv owns `Cell` — the value a row holds — and `PageRequest`, the
+# request the engine relays outward.  Both `core`, so the dependency
+# points at the same layer, which is what `dep-layer` requires.
+btree-nv = { path = "../btree-nv", version = "^0.0.1" }

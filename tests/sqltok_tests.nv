@@ -1,0 +1,124 @@
+// sqltok_tests.nv — the dialect's tokens, and the two gaps in it.
+//
+// EVERY TEST HERE FAILS TODAY: sql-engine-nv is published as its
+// interface and every body is `todo()`, so the first call in each test
+// panics with `not implemented: sql-engine-nv.sqltok.…`.  The
+// assertions are what the bodies will be measured against.
+
+use std.test
+use std.list
+use sqltok
+
+@test
+fn test_a_token_list_always_ends() [io]
+    // Every list ends with `TkEnd`, so a parser's lookahead never has
+    // to check a length before it looks.
+    let toks = sqltok.lex("SELECT 1")
+    test.assert_true(list.len(toks) >= 1, "even empty input lexes to one token")
+    match list.last(toks)
+        Some(t) => test.assert_eq(t.kind, TkEnd)
+        None    => test.fail("the list is never empty")
+
+@test
+fn test_empty_input_is_just_the_end() [io]
+    test.assert_eq(list.len(sqltok.lex("")), 1)
+
+@test
+fn test_keywords_are_matched_without_regard_to_case() [io]
+    // SQL is case-insensitive in its keywords and case-preserving in
+    // its identifiers, and a lexer that got that backwards would break
+    // every dump written by a tool with a different house style.
+    match list.first(sqltok.lex("select"))
+        Some(t) => test.assert_eq(sqltok.keyword(t), Some("SELECT"))
+        None    => test.fail("one token at least")
+    match list.first(sqltok.lex("SeLeCt"))
+        Some(t) => test.assert_true(sqltok.is_keyword(t, "select"), "the predicate folds case too")
+        None    => test.fail("one token at least")
+
+@test
+fn test_an_identifier_keeps_its_case() [io]
+    match list.first(sqltok.lex("MyTable"))
+        Some(t) =>
+            test.assert_eq(t.kind, TkIdent)
+            test.assert_eq_str(t.text, "MyTable")
+        None    => test.fail("one token at least")
+
+@test
+fn test_the_keyword_list_is_the_dialect() [io]
+    // Public because a tool that highlights or completes SQL for this
+    // engine needs the set, and because a user choosing a column name
+    // needs to know what it cannot be called.
+    let words = sqltok.keywords()
+    test.assert_true(list.contains(words, "SELECT"), "SELECT is reserved")
+    test.assert_true(list.contains(words, "GROUP"), "GROUP is reserved")
+    test.assert_false(list.contains(words, "select"), "the list is upper-cased")
+
+@test
+fn test_a_string_literal_decodes_its_doubled_apostrophe() [io]
+    // `'it''s'` is one string holding an apostrophe, and `text` is the
+    // decoded content — a consumer comparing against a value should
+    // never have to unquote.
+    match list.first(sqltok.lex("'it''s'"))
+        Some(t) =>
+            test.assert_eq(t.kind, TkStr)
+            test.assert_eq_str(t.text, "it's")
+        None    => test.fail("one token at least")
+
+@test
+fn test_a_blob_literal_carries_its_hex_digits() [io]
+    match list.first(sqltok.lex("X'a1b2'"))
+        Some(t) =>
+            test.assert_eq(t.kind, TkBlob)
+            test.assert_eq_str(t.text, "a1b2")
+        None    => test.fail("one token at least")
+
+@test
+fn test_a_comment_is_not_recognised_and_that_is_documented() [io]
+    // THIS TEST ASSERTS A GAP, not a feature.  novodb's lexer does not
+    // read `--` or `/* */`, so `-- x` lexes as two minus operators and
+    // an identifier.  A dump that carries a comment is the first file
+    // most people try, so the gap is asserted rather than left to be
+    // discovered — and when the bodies close it, this test is the one
+    // that changes and says so.
+    let toks = sqltok.lex("-- a comment")
+    match list.first(toks)
+        Some(t) =>
+            test.assert_eq(t.kind, TkPunct)
+            test.assert_eq_str(t.text, "-")
+        None    => test.fail("one token at least")
+
+@test
+fn test_a_quoted_identifier_is_not_recognised_either() [io]
+    // The other documented gap: `"select"` cannot be spelled, so a
+    // column with a reserved name is unreachable.
+    match list.first(sqltok.lex("\"select\""))
+        Some(t) => test.assert_eq(t.kind, TkErr)
+        None    => test.fail("one token at least")
+
+@test
+fn test_an_unreadable_run_becomes_a_token_and_the_scan_continues() [io]
+    // The lexer never fails: it emits `TkErr` and keeps going, so the
+    // PARSER reports one error with a position rather than the lexer
+    // reporting a different one without.
+    let toks = sqltok.lex("SELECT # FROM t")
+    test.assert_true(list.len(toks) > 3, "the scan did not stop at the '#'")
+    test.assert_true(list.any(toks, t => t.kind == TkErr), "the bad byte is a token")
+
+@test
+fn test_offsets_turn_into_a_line_and_column() [io]
+    // An error a user sees names a position in the SQL they typed, and
+    // the token is the only thing still holding on to where that was.
+    let src = "SELECT 1\nFROM t"
+    let at = sqltok.position(src, 9)
+    test.assert_eq(at.line, 2)
+    test.assert_eq(at.col, 1)
+    test.assert_eq(sqltok.position(src, 0).line, 1)
+
+@test
+fn test_show_round_trips_through_the_lexer() [io]
+    // `show` is what `EXPLAIN` prints and what the parser's round-trip
+    // check compares, so re-lexing its output has to give the same
+    // token kinds back.
+    let once = sqltok.lex("SELECT a FROM t WHERE a > 1")
+    let twice = sqltok.lex(sqltok.show(once))
+    test.assert_eq(list.len(once), list.len(twice))

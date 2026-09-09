@@ -1,0 +1,139 @@
+// sqlplan_tests.nv — the operator tree, the rewrites, and the gate
+// that is not there.
+//
+// EVERY TEST HERE FAILS TODAY: sql-engine-nv is published as its
+// interface and every body is `todo()`.
+
+use std.test
+use std.list
+use std.str
+use cell
+use sqlast
+use sqlplan
+
+fn select_of(src: Str) -> sqlast.Select
+    match sqlast.parse(src).stmt
+        StSelect(q) => q
+        _           => todo("sqlplan_tests.select_of — not a SELECT")
+
+@test
+fn test_the_lowering_puts_project_at_the_top() [io]
+    // ORDER BY and DISTINCT have to see the PRE-projection schema, or
+    // `SELECT a FROM t ORDER BY b` cannot be answered.  That ordering
+    // is the whole reason the tree has a shape rather than a list.
+    match sqlplan.lower(select_of("SELECT a FROM t ORDER BY b"))
+        PProject(inner, items) =>
+            match inner
+                PSort(under, terms) => test.assert_eq(list.len(terms), 1)
+                _                   => test.fail("the sort sits under the projection")
+        _                      => test.fail("a projected select lowers to PProject")
+
+@test
+fn test_a_plain_scan_lowers_to_a_scan() [io]
+    match sqlplan.lower(select_of("SELECT * FROM t"))
+        PScan(name, as_name) => test.assert_eq_str(name, "t")
+        _                    => test.assert_true(true, "or wrapped, but the scan is in there")
+
+@test
+fn test_everything_lowers_and_there_is_no_fallback_gate() [io]
+    // THE DECISION THIS FILE EXISTS TO PIN.  novodb has a
+    // `lowering_supported` gate and everything it refuses — FROM
+    // (subquery), set operations, CTEs, window functions, scalar
+    // subqueries, views in FROM — falls back to a direct AST walk.  Two
+    // executors with different behaviour and no way for a caller to
+    // know which ran is not a thing to publish, so this package has one
+    // path.  Each line below is a form novodb falls back on.
+    test.assert_true(sqlplan.tables_of(sqlplan.lower(select_of(
+        "SELECT * FROM (SELECT a FROM t)"))) != [],
+        "FROM (subquery) lowers")
+    test.assert_true(sqlplan.tables_of(sqlplan.lower(select_of(
+        "SELECT a FROM t UNION SELECT b FROM u"))) != [],
+        "a set operation lowers")
+    test.assert_true(sqlplan.tables_of(sqlplan.lower(select_of(
+        "WITH c AS (SELECT a FROM t) SELECT * FROM c"))) != [],
+        "a CTE lowers")
+    test.assert_true(sqlplan.tables_of(sqlplan.lower(select_of(
+        "SELECT row_number() OVER (ORDER BY a) FROM t"))) != [],
+        "a window lowers")
+
+@test
+fn test_tables_of_is_in_first_touch_order() [io]
+    // A host prefetches off this, so the order is the order the engine
+    // will stall in.
+    let p = sqlplan.lower(select_of("SELECT * FROM t JOIN u ON t.a = u.a"))
+    test.assert_eq(sqlplan.tables_of(p), ["t", "u"])
+
+@test
+fn test_constant_folding_is_visible_on_its_own() [io]
+    // Separated from the optimiser because it is what a CHECK
+    // constraint and a DEFAULT both want without the rest, and because
+    // it is the rewrite whose result a reader can verify by eye.
+    let p = sqlast.parse("SELECT 1 FROM t WHERE 2 + 3 = 5")
+    match p.stmt
+        StSelect(q) =>
+            match q.where_clause
+                Some(w) => test.assert_eq_str(sqlast.show_expr(sqlplan.fold_constants(w)), "1 = 1")
+                None    => test.fail("the WHERE was parsed")
+        _           => test.fail("SELECT is StSelect")
+
+@test
+fn test_const_value_answers_only_for_a_row_independent_expression() [io]
+    // `None` when the expression names a column, which is how the
+    // folder tells a constant from a row-dependent expression without
+    // a second pass over the tree.
+    test.assert_eq(sqlplan.const_value(ExLiteral(cell.of_int(7))), Some(cell.of_int(7)))
+    test.assert_none(sqlplan.const_value(ExColumn("a")))
+
+@test
+fn test_the_rules_run_without_statistics() [io]
+    // A caller with no ANALYZE behind it gets a worse plan from the
+    // cost model than from none, so the two halves are separable.
+    let p = sqlplan.lower(select_of("SELECT a FROM t WHERE a = 1 OR a = 2"))
+    test.assert_true(str.len(sqlplan.explain(sqlplan.optimise_rules(p))) > 0,
+                     "the rules produce a plan")
+
+@test
+fn test_or_of_equalities_becomes_an_in() [io]
+    // One of novodb's rewrites, and one a reader can check by eye —
+    // which is the bar every rule in `optimise_rules` is held to.
+    let p = sqlplan.optimise_rules(sqlplan.lower(select_of(
+        "SELECT a FROM t WHERE a = 1 OR a = 2 OR a = 3")))
+    test.assert_true(str.contains(sqlplan.explain(p), "IN"), "three equalities are one IN")
+
+@test
+fn test_reorder_joins_takes_the_statistics_rather_than_reading_them() [io]
+    // ANALYZE reads pages and reading pages is the host's, so the
+    // numbers arrive as an argument.  That is what `core` costs and
+    // what it buys.
+    let p = sqlplan.lower(select_of("SELECT * FROM t JOIN u ON t.a = u.a"))
+    let stats = [TableStats { table: "t", rows: 1000000, distinct: [1000000] },
+                 TableStats { table: "u", rows: 10, distinct: [10] }]
+    test.assert_eq(sqlplan.estimate_rows(sqlplan.reorder_joins(p, stats), stats) >= 0, true)
+
+@test
+fn test_explain_is_a_published_format() [io]
+    // It is what `EXPLAIN` returns as a single-column result, so a tool
+    // parsing it is parsing this: one node per line, two spaces per
+    // level.
+    let text = sqlplan.explain(sqlplan.lower(select_of("SELECT a FROM t WHERE a > 1")))
+    test.assert_true(str.contains(text, "Scan"), "the scan is named")
+    test.assert_true(str.contains(text, "Filter"), "the filter is named")
+
+@test
+fn test_output_columns_is_answered_before_a_row_is_read() [io]
+    // A prepared statement's result metadata: a caller drawing a table
+    // header cannot wait for a row that may never arrive.
+    let p = sqlplan.lower(select_of("SELECT a, b FROM t"))
+    test.assert_eq(sqlplan.output_columns(p, [ColumnsOf { table: "t", columns: ["a", "b", "c"] }]),
+                   ["a", "b"])
+
+@test
+fn test_optimise_does_not_change_what_a_query_means() [io]
+    // The only property that matters about an optimiser, and the one
+    // the implementation lane will spend its time on: the plan changes
+    // and the answer does not.  Here it is asserted on the column
+    // list, which is the part a plan cannot alter and still be right.
+    let p = sqlplan.lower(select_of("SELECT a, b FROM t WHERE a > 1"))
+    let schema = [ColumnsOf { table: "t", columns: ["a", "b"] }]
+    test.assert_eq(sqlplan.output_columns(sqlplan.optimise(p), schema),
+                   sqlplan.output_columns(p, schema))

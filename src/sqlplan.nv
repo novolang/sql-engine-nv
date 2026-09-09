@@ -1,0 +1,166 @@
+// sqlplan.nv — the operator tree between the AST and the rows.
+//
+// A `Select` says what the answer is; a `Plan` says how it is
+// computed, and it is the thing the rewrites and the cost model
+// operate on.  Volcano-shaped, and the lowering preserves SQL's
+// evaluation order:
+//
+//     Scan → Join → Filter → Aggregate → Sort → Distinct → Limit → Project
+//
+// Project sits at the TOP so that ORDER BY and DISTINCT see the
+// pre-projection schema, which is what SQL means by ordering on a
+// column the select list did not ask for.
+//
+// This module is why the package is worth splitting out of novodb at
+// all.  novodb has the same IR in `plan.nv` and its own comment on the
+// alternative is the argument: walking the `SelectStmt` directly
+// *"works for direct execution but gives an optimiser nothing typed to
+// rewrite."*  A published `Plan` is also what `EXPLAIN` renders and
+// what a tool showing a user why their query is slow reads.
+//
+// WHAT DOES NOT LOWER
+//
+// novodb's `lowering_supported` is a gate, and everything it refuses
+// falls back to a direct AST walk: `FROM (subquery)`, set operations,
+// CTEs, window functions, INSTEAD OF triggers, scalar subqueries in
+// expressions, and views in FROM.  Carrying a gate like that across a
+// package boundary would publish two executors with different
+// behaviour and no way for a caller to know which one ran, so this
+// package does not: `lower` returns a `Plan` for every `Select` it
+// accepts, and the arms below cover the cases novodb falls back on.
+// That is the largest single piece of work the implementation lane
+// inherits, and it is a decision made here rather than discovered
+// there.
+
+use cell
+use sqlast
+
+// One node of the operator tree.
+pub enum Plan
+    // A base table, by name.  `alias` is `""` when the query wrote no
+    // `AS`.
+    PScan(table: Str, as_name: Str)
+    // A materialised sub-select standing in for a table: `FROM
+    // (SELECT …)`, a view's body, or a CTE binding.
+    PSubquery(inner: Plan, as_name: Str)
+    // A join chain applied left to right.  Flat rather than a nested
+    // binary tree because that is the shape the executor consumes; a
+    // Selinger reorderer would produce the same list in another order.
+    PJoin(left: Plan, joins: [JoinStep])
+    PFilter(input: Plan, predicate: sqlast.Expr)
+    PAggregate(input: Plan, group_by: [Str], items: [sqlast.SelItem], having: ?sqlast.Expr)
+    PSort(input: Plan, order_by: [sqlast.OrderTerm])
+    PDistinct(input: Plan)
+    PLimit(input: Plan, limit: ?Int, offset: ?Int)
+    PProject(input: Plan, items: [sqlast.SelItem])
+    // A window-function pass over an already-ordered input.
+    PWindow(input: Plan, calls: [sqlast.WindowCall])
+    // `UNION` / `INTERSECT` / `EXCEPT`, evaluated flat and left to
+    // right, matching SQLite.
+    PSetOp(left: Plan, op: sqlast.SetOp, all: Bool, right: Plan)
+    // A recursive CTE: the anchor, then the body run to a fixed point.
+    PRecursive(anchor: Plan, body: Plan, name: Str)
+    // A row source the query wrote out itself: `VALUES`, and the row
+    // list of an `INSERT`.
+    PValues(rows: [[sqlast.Expr]])
+
+// One step of a join chain.
+pub struct JoinStep
+    kind: sqlast.JoinKind
+    right: Plan
+    as_name: Str
+    on: sqlast.Expr
+
+// Lower a SELECT to an unoptimised plan.
+//
+// Every `Select` lowers.  See the module header for why there is no
+// gate and no fallback path.
+pub fn lower(q: sqlast.Select) -> Plan
+    todo("sql-engine-nv.sqlplan.lower")
+
+// Apply the rule-based rewrites, then the cost-based ones.
+//
+// The rules are novodb's, and each is a rewrite a reader can check by
+// eye: constant folding, `NOT` simplification, `OR`-of-equalities to
+// `IN`, predicate pushdown through a join and through a GROUP BY when
+// the predicate names only grouping columns, inclusive-range merging,
+// and dropping an identity LIMIT.
+pub fn optimise(p: Plan) -> Plan
+    todo("sql-engine-nv.sqlplan.optimise")
+
+// Apply only the rewrites that do not need statistics.
+//
+// Separated from `optimise` because a caller with no `ANALYZE` behind
+// it gets a worse plan from the cost model than from none, and because
+// a test that wants to check one rewrite should not have to hold the
+// statistics still.
+pub fn optimise_rules(p: Plan) -> Plan
+    todo("sql-engine-nv.sqlplan.optimise_rules")
+
+// Reorder a join chain by estimated cardinality.
+//
+// Takes the statistics rather than reading them from anywhere, which
+// is the `core` shape: the numbers come from `ANALYZE`, and `ANALYZE`
+// reads pages, and reading pages is the host's.
+pub fn reorder_joins(p: Plan, stats: [TableStats]) -> Plan
+    todo("sql-engine-nv.sqlplan.reorder_joins")
+
+// What `ANALYZE` learned about one table.
+//
+// `distinct` runs parallel to a table's columns and holds the count of
+// distinct values in each, which is what a selectivity estimate needs.
+pub struct TableStats
+    table: Str
+    rows: Int
+    distinct: [Int]
+
+// The plan as the tree `EXPLAIN` prints, one node per line, two spaces
+// per level.
+//
+// This rendering is a published format: it is what `EXPLAIN` returns
+// as a single-column result, so a tool parsing it is parsing this.
+pub fn explain(p: Plan) -> Str
+    todo("sql-engine-nv.sqlplan.explain")
+
+// The estimated row count this plan produces, given these statistics.
+//
+// Public because the number is what a caller comparing two plans
+// wants, and because a consumer with better statistics than `ANALYZE`
+// collected can supply them.
+pub fn estimate_rows(p: Plan, stats: [TableStats]) -> Int
+    todo("sql-engine-nv.sqlplan.estimate_rows")
+
+// Every base table this plan reads, in first-touch order.
+//
+// The engine asks this to know which trees it needs before it starts,
+// which is what lets a host prefetch instead of stalling once per
+// table.
+pub fn tables_of(p: Plan) -> [Str]
+    todo("sql-engine-nv.sqlplan.tables_of")
+
+// The column names this plan's rows will carry.
+//
+// Answered from the plan and the schema without running anything,
+// which is what a prepared statement's result metadata is.
+pub fn output_columns(p: Plan, schema: [ColumnsOf]) -> [Str]
+    todo("sql-engine-nv.sqlplan.output_columns")
+
+// One table's column names, for the metadata answer above.
+pub struct ColumnsOf
+    table: Str
+    columns: [Str]
+
+// Fold every constant sub-expression to a literal.
+//
+// Exposed on its own because it is the rewrite a CHECK constraint and
+// a DEFAULT both want without the rest of the optimiser, and because
+// it is the one whose result a reader can verify by eye.
+pub fn fold_constants(e: sqlast.Expr) -> sqlast.Expr
+    todo("sql-engine-nv.sqlplan.fold_constants")
+
+// Evaluate an expression that names no column.
+//
+// `None` when the expression names one, which is how the folder tells
+// a constant from a row-dependent expression without a second pass.
+pub fn const_value(e: sqlast.Expr) -> ?cell.Cell
+    todo("sql-engine-nv.sqlplan.const_value")
