@@ -9,7 +9,7 @@
 use std.test
 use std.list
 use std.str
-use cell
+use btcell
 use btree
 use sqltok
 use sqlengine
@@ -222,13 +222,13 @@ fn test_evaluate_runs_one_expression_over_one_row() [io]
     // Public because a CHECK, a DEFAULT, a trigger's WHEN and a partial
     // index all want it, and because a consumer filtering rows it
     // already holds should not have to build a plan.
-    match sqlengine.evaluate(ExColumn("a"), ["a", "b"], [cell.of_int(7), cell.null_cell()])
-        Ok(v)  => test.assert_eq(cell.as_int(v), Some(7))
+    match sqlengine.evaluate(ExColumn("a"), ["a", "b"], [btcell.of_int(7), btcell.null_cell()])
+        Ok(v)  => test.assert_eq(btcell.as_int(v), Some(7))
         Err(x) => test.fail(x.message())
 
 @test
 fn test_evaluate_reports_a_divide_by_zero_rather_than_trapping() [io]
-    let e = ExBinop(BopDiv, ExLiteral(cell.of_int(1)), ExLiteral(cell.of_int(0)))
+    let e = ExBinop(BopDiv, ExLiteral(btcell.of_int(1)), ExLiteral(btcell.of_int(0)))
     match sqlengine.evaluate(e, [], [])
         Ok(v)  => test.fail("one over zero is not a value")
         Err(x) => test.assert_eq(x, SeDivideByZero)
@@ -236,19 +236,19 @@ fn test_evaluate_reports_a_divide_by_zero_rather_than_trapping() [io]
 @test
 fn test_compare_follows_sqlite_storage_class_order() [io]
     // NULL first, then numbers by value, then text, then blobs — which
-    // is `cell.tag`.  A sort that got this wrong would order a mixed
+    // is `btcell.tag`.  A sort that got this wrong would order a mixed
     // column differently from every other SQLite tool.
-    test.assert_eq(sqlengine.compare(cell.null_cell(), cell.of_int(0)), 0 - 1)
-    test.assert_eq(sqlengine.compare(cell.of_int(1), cell.of_int(1)), 0)
-    test.assert_eq(sqlengine.compare(cell.of_str("a"), cell.of_int(9)), 1)
+    test.assert_eq(sqlengine.compare(btcell.null_cell(), btcell.of_int(0)), 0 - 1)
+    test.assert_eq(sqlengine.compare(btcell.of_int(1), btcell.of_int(1)), 0)
+    test.assert_eq(sqlengine.compare(btcell.of_str("a"), btcell.of_int(9)), 1)
 
 @test
 fn test_affinity_is_applied_on_the_way_in() [io]
     // SQLite coerces at INSERT, so `INSERT INTO t(n) VALUES ('7')` into
     // an INTEGER column stores the integer.  A value that cannot be
     // coerced is stored as it is, which is also SQLite.
-    test.assert_eq(cell.as_int(sqlengine.apply_affinity(cell.of_str("7"), CtInteger)), Some(7))
-    test.assert_eq(cell.as_str(sqlengine.apply_affinity(cell.of_str("x"), CtInteger)), Some("x"))
+    test.assert_eq(btcell.as_int(sqlengine.apply_affinity(btcell.of_str("7"), CtInteger)), Some(7))
+    test.assert_eq(btcell.as_str(sqlengine.apply_affinity(btcell.of_str("x"), CtInteger)), Some("x"))
 
 @test
 fn test_a_table_carries_the_page_its_tree_is_rooted_at() [io]

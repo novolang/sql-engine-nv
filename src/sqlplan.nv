@@ -32,7 +32,7 @@
 // inherits, and it is a decision made here rather than discovered
 // there.
 
-use cell
+use btcell
 use sqlast
 
 // One node of the operator tree.
@@ -162,5 +162,5 @@ pub fn fold_constants(e: sqlast.Expr) -> sqlast.Expr
 //
 // `None` when the expression names one, which is how the folder tells
 // a constant from a row-dependent expression without a second pass.
-pub fn const_value(e: sqlast.Expr) -> ?cell.Cell
+pub fn const_value(e: sqlast.Expr) -> ?btcell.Cell
     todo("sql-engine-nv.sqlplan.const_value")

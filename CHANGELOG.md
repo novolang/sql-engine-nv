@@ -4,6 +4,11 @@ Newest first.  Below `1.0.0` a breaking change bumps the **minor**
 number and a compatible one the **patch**; see [Version numbers in the
 Orbit package registry](https://novo-lang.org/docs/registry/semver.html).
 
+## 0.0.4 — 2026-09-12
+
+- **BREAKING — `cell.Cell` is `btcell.Cell`.**  btree-nv's value module was named `cell`, which is a standard library module name and no longer builds, so btree-nv 0.0.3 renamed it to `btcell`.  Nothing in this package's own surface changed: the type is the same type, and a consumer that names it replaces `use cell` with `use btcell`.
+- Depends on `btree-nv = "^0.0.3"`.  0.0.2 does not build, so a resolution that lands on it is a build that fails.
+
 ## 0.0.3 — 2026-09-10
 
 - **Toolchain floor is 0.8.9**: the bodies and signatures use what 0.8.9 added (`todo()`, a bound effect parameter, the four layers), and the manifest says so instead of letting an older toolchain fail on an undefined function.  No signature changed.

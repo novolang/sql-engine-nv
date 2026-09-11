@@ -33,7 +33,7 @@
 // classes, twice, with a conversion at every INSERT.  Here there is
 // one, it is btree-nv's, and it is the storage one.
 
-use cell
+use btcell
 use sqltok
 
 // A column's declared storage class.
@@ -74,7 +74,7 @@ pub struct ColDef
     // column, or passes NULL, gets `max(col) + 1`, or 1 on an empty
     // table.  Only meaningful with `CtInteger` and `primary_key`.
     auto_increment: Bool
-    default_value: ?cell.Cell
+    default_value: ?btcell.Cell
     check: ?Expr
 
 // A comparison operator.
@@ -144,7 +144,7 @@ pub enum Expr
     ExQualified(table: Str, column: Str)
     // A literal of any storage class, which is why there is no
     // separate integer / float / string / blob / null arm.
-    ExLiteral(value: cell.Cell)
+    ExLiteral(value: btcell.Cell)
     ExAgg(call: AggCall)
     ExCompare(op: CmpOp, lhs: Expr, rhs: Expr)
     // `<e> IS [NOT] NULL`.

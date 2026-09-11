@@ -37,7 +37,7 @@
 // `StBegin`, `StCommit` and `StRollback` parse and step to
 // `SrDone(0)`; what they mean is `pager-nv`'s to decide.
 
-use cell
+use btcell
 use btree
 use sqltok
 use sqlast
@@ -177,7 +177,7 @@ pub fn columns(st: Statement) -> [Str]
 // What one `step` did.
 pub enum StepResult
     // One row of the answer.
-    SrRow(row: [cell.Cell])
+    SrRow(row: [btcell.Cell])
     // The statement finished.  `rows_affected` is the row count for a
     // SELECT and the number of rows changed for everything else.
     SrDone(rows_affected: Int)
@@ -287,15 +287,15 @@ pub struct NowSnapshot
 // filtering rows it already holds should not have to build a plan to
 // do it.  `columns` names the row's cells in order.
 pub fn evaluate(e: sqlast.Expr, columns: [Str],
-                row: [cell.Cell]) -> Result<cell.Cell, sqlast.SqlError>
+                row: [btcell.Cell]) -> Result<btcell.Cell, sqlast.SqlError>
     todo("sql-engine-nv.sqlengine.evaluate")
 
 // Compare two cells by SQL's ordering.
 //
 // NULL sorts before everything, then integers and floats by value,
 // then text, then blobs — SQLite's storage-class order, which is
-// `cell.tag`.  Answers -1, 0 or 1.
-pub fn compare(a: cell.Cell, b: cell.Cell) -> Int
+// `btcell.tag`.  Answers -1, 0 or 1.
+pub fn compare(a: btcell.Cell, b: btcell.Cell) -> Int
     todo("sql-engine-nv.sqlengine.compare")
 
 // Coerce a cell to a column's declared affinity.
@@ -303,5 +303,5 @@ pub fn compare(a: cell.Cell, b: cell.Cell) -> Int
 // SQLite applies affinity on the way in, so `INSERT INTO t(n) VALUES
 // ('7')` into an INTEGER column stores the integer 7.  A value that
 // cannot be coerced is stored as it is, which is also SQLite.
-pub fn apply_affinity(c: cell.Cell, ty: sqlast.ColType) -> cell.Cell
+pub fn apply_affinity(c: btcell.Cell, ty: sqlast.ColType) -> btcell.Cell
     todo("sql-engine-nv.sqlengine.apply_affinity")

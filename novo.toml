@@ -1,6 +1,6 @@
 [package]
 name        = "sql-engine-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "SQL in, rows out, and not one byte read: a lexer, a recursive-descent parser over SQLite's dialect, a rule-and-cost plan IR, and an executor that reaches its tables through page requests the host answers."
 license     = "Apache-2.0"
 
@@ -33,4 +33,4 @@ novo        = ">= 0.8.9"
 # btree-nv owns `Cell` — the value a row holds — and `PageRequest`, the
 # request the engine relays outward.  Both `core`, so the dependency
 # points at the same layer, which is what `dep-layer` requires.
-btree-nv = "^0.0.2"
+btree-nv = "^0.0.3"

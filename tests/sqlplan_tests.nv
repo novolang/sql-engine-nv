@@ -7,7 +7,7 @@
 use std.test
 use std.list
 use std.str
-use cell
+use btcell
 use sqlast
 use sqlplan
 
@@ -81,7 +81,7 @@ fn test_const_value_answers_only_for_a_row_independent_expression() [io]
     // `None` when the expression names a column, which is how the
     // folder tells a constant from a row-dependent expression without
     // a second pass over the tree.
-    test.assert_eq(sqlplan.const_value(ExLiteral(cell.of_int(7))), Some(cell.of_int(7)))
+    test.assert_eq(sqlplan.const_value(ExLiteral(btcell.of_int(7))), Some(btcell.of_int(7)))
     test.assert_none(sqlplan.const_value(ExColumn("a")))
 
 @test

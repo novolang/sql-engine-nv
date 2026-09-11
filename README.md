@@ -26,14 +26,14 @@ differs between those is whoever answers `PrNeedPage`.
 ```novo
 use std.list
 use btree
-use cell
+use btcell
 use sqlengine
 
 // Run one statement to completion against a page store the caller
 // already has.  `read_page` is the host's; nothing else here is.
-fn query(schema: sqlengine.Schema, sql: Str) -> [[cell.Cell]] [fs]
+fn query(schema: sqlengine.Schema, sql: Str) -> [[btcell.Cell]] [fs]
     var e = sqlengine.open(schema)
-    var rows: [[cell.Cell]] = []
+    var rows: [[btcell.Cell]] = []
     match sqlengine.prepare(e, sql)
         Err(x) => rows
         Ok(start) =>
@@ -84,7 +84,7 @@ function that makes one.
 
 ```novo
 pub enum StepResult
-    SrRow(row: [cell.Cell])
+    SrRow(row: [btcell.Cell])
     SrDone(rows_affected: Int)
     SrPage(request: btree.PageRequest)
     SrError(err: sqlast.SqlError)
@@ -126,7 +126,7 @@ Four things did not come across unchanged.
 | --- | --- | --- |
 | `lex.Tok` is ~130 nullary variants with an `is_tk_<word>` predicate each | `Token { kind, text, offset }` and `keyword()` | novodb's own parser never matches the enum and says so at the top of the file; publishing it would make every new keyword a breaking change for anyone who did |
 | a view body, a CTE body, a scalar subquery and a rich `IN (SELECT …)` are RAW SQL TEXT, re-parsed on every read | `Select` holds `?Select` and `[Select]` | novodb's reason is a declaration-order limitation in its parser file, not a design choice — its comments say so |
-| `parse.Value` and `btree.Cell` are the same five storage classes twice, converted at every INSERT | one `cell.Cell`, btree-nv's | across a package boundary the duplication would put the bridge on the public surface |
+| `parse.Value` and `btree.Cell` are the same five storage classes twice, converted at every INSERT | one `btcell.Cell`, btree-nv's | across a package boundary the duplication would put the bridge on the public surface |
 | `lowering_supported` gates the plan path; everything it refuses falls back to a direct AST walk | every `Select` lowers | two executors with different behaviour and no way for a caller to know which ran is not a thing to publish |
 
 The last one is the largest piece of work the implementation lane
