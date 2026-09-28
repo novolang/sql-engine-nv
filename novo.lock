@@ -3,6 +3,6 @@
 [btree-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.3"
-version = "0.0.3"
-hash = "dea0015f5fe1adfdf1ed881af7959cbef9b4abea17ce42f9109ac515d66a3f85"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "d7aa0e8875a1c58721c97969ce92ee61564afa5b7cea3300b218142901b9ee18"
