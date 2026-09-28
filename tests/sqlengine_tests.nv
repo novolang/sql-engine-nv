@@ -21,7 +21,7 @@ struct Page
 
 fn page_bytes(pages: [Page], id: Int) -> ?[Int]
     match list.find(pages, p => p.id == id)
-        Some(p) => Some(p.bytes)
+        Some(p) => Some(p.bytes[:])
         None    => None
 
 // What one run of a statement produced, and what it asked for.
